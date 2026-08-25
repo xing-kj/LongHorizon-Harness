@@ -63,7 +63,7 @@ _AGENTS = (
     ("opencode", "opencode", DEFAULT_OPENCODE_MODEL),
 )
 _AGENT_CHOICES = tuple(name for name, _, _ in _AGENTS)
-_MCP_AGENT_CHOICES = ("claude_code", "codex")
+_MCP_AGENT_CHOICES = ("claude_code", "codex", "opencode")
 # Each agent reads MCP config in its own format, so each gets its own flag.
 _MCP_CONFIG_DESTS = {"claude_code": "claude_mcp_config", "codex": "codex_mcp_config"}
 
@@ -1748,7 +1748,8 @@ def _run_command(args: argparse.Namespace) -> int:
     def resolve_mcp_config(agent_name: str) -> str | None:
         # The agent's own --*-mcp-config wins; otherwise the installed
         # computer-use plugin with the highest priority is loaded for this agent.
-        if agent_name in {"deepseek_harness", "opencode"}:
+        # DeepSeek Harness phase 1 has no MCP integration yet.
+        if agent_name == "deepseek_harness":
             return None
         override = getattr(args, _MCP_CONFIG_DESTS[agent_name], None)
         if override:
@@ -2303,6 +2304,7 @@ def _build_agent(
             prompt_dir=prompt_dir,
             role=role,
             hidden_paths=hidden_paths,
+            mcp_config=mcp_config,
             reasoning_effort=reasoning_effort,
         )
         if model is not None:
