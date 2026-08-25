@@ -385,7 +385,33 @@ def _fallback_hint(role: str, suffix: str) -> str:
     return ", then ".join(chain)
 
 
+def _force_utf8_stdio() -> None:
+    """Make all console/pipe output UTF-8 on Windows.
+
+    The harness's durable artifacts (reports, events, trajectories) are UTF-8;
+    without this, the same Chinese text prints as mojibake through a cp936
+    pipe and redirected logs become unreadable to every other tool in the
+    chain.  The console output codepage is switched to 65001 as well so legacy
+    conhost windows decode the bytes correctly.
+    """
+
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+    except (OSError, AttributeError, ImportError):
+        pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _force_utf8_stdio()
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     run_defaults: dict[str, object] = {}
     config_error: ProjectConfigError | None = None

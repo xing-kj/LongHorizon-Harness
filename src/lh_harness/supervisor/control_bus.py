@@ -29,28 +29,10 @@ _TRUSTED_SYSTEM_ALIASES = frozenset({"/var", "/tmp", "/etc"})
 # those platforms degrade to plain path operations guarded by a best-effort
 # symlink scan instead of failing closed, because the run tree is owned by the
 # same operator who started the process.
-_SECURE_DIRFD = bool(
-    getattr(os, "O_NOFOLLOW", 0)
-    and getattr(os, "O_DIRECTORY", 0)
-    and os.open in getattr(os, "supports_dir_fd", set())
-    and os.mkdir in getattr(os, "supports_dir_fd", set())
-)
-
-
-def _validate_no_symlink_chain(path: Path) -> None:
-    """Reject any symlinked component below the anchor (best-effort platforms)."""
-
-    absolute = Path(os.path.abspath(os.fspath(path)))
-    anchor_parts = len(Path(absolute.anchor).parts)
-    current = Path(*absolute.parts[:anchor_parts])
-    for component in absolute.parts[anchor_parts:]:
-        current = current / component
-        try:
-            metadata = os.lstat(current)
-        except FileNotFoundError:
-            return
-        if stat.S_ISLNK(metadata.st_mode):
-            raise OSError(f"symlinked path component rejected: {current}")
+# The canonical definitions live in utils.platform_caps; the private aliases
+# below keep every existing importer (manager, cli, tests) working unchanged.
+from ..utils.platform_caps import SECURE_DIRFD as _SECURE_DIRFD  # noqa: E402
+from ..utils.platform_caps import validate_no_symlink_chain as _validate_no_symlink_chain  # noqa: E402
 
 
 def _anchored_parent(parent_fd: int, fallback_dir: str | Path) -> int | Path:

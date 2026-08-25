@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 import shlex
 
-IS_WINDOWS = os.name == "nt"
+from .platform_caps import IS_WINDOWS
 
 
 def shell_quote(value: str) -> str:
