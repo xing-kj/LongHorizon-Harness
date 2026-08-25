@@ -80,7 +80,7 @@ def _process_lock(handle: Any):
             locked = True
         else:
             handle.seek(0)
-            deadline = time.time() + 30.0
+            deadline = time.time() + 5.0
             while True:
                 try:
                     msvcrt_module.locking(fileno, msvcrt_module.LK_NBLCK, 1)
@@ -146,6 +146,8 @@ def _open_nofollow(path: str | Path, *, directory: bool = False) -> int:
             raise OSError("secure control-bus path opening is unavailable")
         absolute = Path(_absolute_anchored_path(path))
         _validate_no_symlink_chain(absolute.parent)
+        if absolute.is_symlink():
+            raise OSError("control-bus path is a symlink")
         descriptor = os.open(str(absolute), os.O_RDONLY | getattr(os, "O_BINARY", 0))
         try:
             if not stat.S_ISREG(os.fstat(descriptor).st_mode):
@@ -218,6 +220,11 @@ def _ensure_dir_fd_nofollow(path: str | Path, *, mode: int = 0o700) -> int:
         or os.mkdir not in getattr(os, "supports_dir_fd", set())
     ):
         target = Path(_absolute_anchored_path(path))
+        # Reject symlinked ancestors BEFORE creating anything, so a swapped
+        # run boundary cannot be followed as a side effect of the mkdir.
+        parent = target.parent
+        if str(parent) != str(target.anchor):
+            _validate_no_symlink_chain(parent)
         target.mkdir(mode=mode, parents=True, exist_ok=True)
         _validate_no_symlink_chain(target)
         return -1
@@ -308,14 +315,16 @@ def _open_private_regular_at(
         base = Path(_absolute_anchored_path(parent_fd))
         base.mkdir(mode=0o700, parents=True, exist_ok=True)
         _validate_no_symlink_chain(base)
-        final = str(base / name)
+        final = base / name
+        if final.is_symlink():
+            raise OSError("private file is a symlink")
         for _ in range(32):
             try:
                 try:
-                    descriptor = os.open(final, flags | os.O_CREAT | os.O_EXCL | binary, mode)
+                    descriptor = os.open(str(final), flags | os.O_CREAT | os.O_EXCL | binary, mode)
                 except FileExistsError:
                     try:
-                        descriptor = os.open(final, flags | binary)
+                        descriptor = os.open(str(final), flags | binary)
                     except FileNotFoundError:
                         continue
             except OSError:
@@ -399,13 +408,20 @@ def _atomic_bytes_write(path: Path, payload: bytes, *, mode: int = 0o600) -> Non
     path = Path(path)
     if not _SECURE_DIRFD:
         parent = Path(_absolute_anchored_path(path.parent))
+        if str(parent) != Path(parent.anchor).anchor and str(parent) != str(parent.anchor):
+            _validate_no_symlink_chain(parent)
         parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         _validate_no_symlink_chain(parent)
         handle_fd, temporary_text = tempfile.mkstemp(
             prefix=f".{path.name}.", suffix=".tmp", dir=str(parent)
         )
         try:
-            with os.fdopen(handle_fd, "wb") as handle:
+            try:
+                handle = os.fdopen(handle_fd, "wb")
+            except BaseException:
+                os.close(handle_fd)
+                raise
+            with handle:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -479,13 +495,21 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
     # final file can be opened with anchored no-follow semantics.
     if not _SECURE_DIRFD:
         parent = Path(_absolute_anchored_path(path.parent))
+        if str(parent) != Path(parent.anchor).anchor and str(parent) != str(parent.anchor):
+            _validate_no_symlink_chain(parent)
         parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         _validate_no_symlink_chain(parent)
-        with open(str(path), "a", encoding="utf-8") as handle:
+        handle = open(str(path), "a", encoding="utf-8")
+        try:
+            metadata = os.fstat(handle.fileno())
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise OSError("control log is not an unaliased regular file")
             with _process_lock(handle):
                 handle.write(line)
                 handle.flush()
                 os.fsync(handle.fileno())
+        finally:
+            handle.close()
         return
     fd: int | None = None
     parent_fd: int | None = None
@@ -655,13 +679,25 @@ class ControlBus:
                 # Windows fallback: path-based lock file with an msvcrt
                 # byte-range lock.  Weaker than anchored walking, but it is a
                 # real cross-process critical section.
-                self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-                _validate_no_symlink_chain(self.root)
+                _ensure_dir_nofollow(self.root)
                 fallback_handle = open(str(self.lock_path), "a+", encoding="utf-8")
                 try:
-                    with _process_lock(fallback_handle):
-                        yield
+                    metadata = os.fstat(fallback_handle.fileno())
+                    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                        raise OSError("control lock is not an unaliased regular file")
+                except OSError as exc:
+                    fallback_handle.close()
+                    raise RuntimeError("secure control-bus locking is unavailable") from exc
+                lock_context = _process_lock(fallback_handle)
+                try:
+                    lock_context.__enter__()
+                except OSError as exc:
+                    fallback_handle.close()
+                    raise RuntimeError("secure control-bus locking is unavailable") from exc
+                try:
+                    yield
                 finally:
+                    lock_context.__exit__(None, None, None)
                     fallback_handle.close()
                 return
             lock_handle = None
@@ -895,8 +931,36 @@ class ControlBus:
         return _read_json_file(self.owner_path)
 
 
+def _iter_run_control_dirs_pathbased(root: Path) -> Iterator[Path]:
+    """Windows fallback: skip symlinked run boundaries by lstat inspection."""
+
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if entry.is_symlink():
+                continue
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            control = Path(entry.path) / "control"
+            try:
+                control_meta = os.lstat(control)
+            except OSError:
+                continue
+            if stat.S_ISLNK(control_meta.st_mode) or not stat.S_ISDIR(control_meta.st_mode):
+                continue
+        except OSError:
+            continue
+        yield root / entry.name
+
+
 def iter_run_control_dirs(runs_root: str | Path) -> Iterator[Path]:
     root = Path(runs_root).expanduser().resolve()
+    if not _SECURE_DIRFD:
+        yield from _iter_run_control_dirs_pathbased(root)
+        return
     try:
         root_fd = _open_nofollow(root, directory=True)
     except OSError:

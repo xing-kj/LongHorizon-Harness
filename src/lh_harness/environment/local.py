@@ -14,7 +14,9 @@ from pathlib import Path
 from ..types import DEFAULT_TMP_DIR, ExecResult
 from ..supervisor.control_bus import _anchored_parent, _ensure_dir_fd_nofollow, _open_private_regular_at
 from ..trajectory_artifacts import StreamingTrajectoryArtifactWriter
+from ..utils import win_job
 from ..utils.process_group import (
+    SIGKILL,
     kill_process_group,
     signal_process_group,
     track_process_group,
@@ -99,8 +101,15 @@ class LocalEnvironment:
         Path(remote_path).expanduser().mkdir(parents=True, exist_ok=True)
 
     async def chmod(self, remote_path: str, mode: str) -> None:
-        """POSIX permission bits have no NTFS equivalent; nothing to do."""
-        return None
+        """Apply POSIX permission bits; a no-op where they have no meaning."""
+        if os.name == "nt":
+            # NTFS has no POSIX permission bits; nothing to apply.
+            return
+        try:
+            os.chmod(remote_path, int(str(mode), 8))
+        except (OSError, ValueError):
+            # Best effort: the local file is already operator-readable.
+            pass
 
     async def exec(
         self,
@@ -136,6 +145,10 @@ class LocalEnvironment:
                 limit=64 * 1024 * 1024,
             )
             track_process_group(proc.pid)
+            # Windows: put the child into a kill-on-close Job Object so every
+            # later termination (and the atexit sweep) kills the whole tree by
+            # kernel handle instead of by reusable pid.
+            win_job.assign(proc.pid)
             # Always drain incrementally. Besides powering the live dashboard,
             # this leaves the bytes already received available if a timeout or
             # cancellation happens before the child exits normally.
@@ -187,13 +200,16 @@ class LocalEnvironment:
             # and an unshielded await would be cancelled before the child exits.
             await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=5))
         except asyncio.TimeoutError:
-            signal_process_group(proc.pid, signal.SIGKILL)
+            signal_process_group(proc.pid, SIGKILL)
             with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
                 await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=5))
         except asyncio.CancelledError:
             # Cancelled again mid-wait: fall back to the blocking sweep so the
             # agent cannot outlive us.
             kill_process_group(proc.pid)
+        # Windows: the Job Object kill is the authoritative tree termination —
+        # closing the job reaps any descendants the signals above missed.
+        win_job.kill_tree(proc.pid)
 
     @staticmethod
     async def _finish_io(io_task: asyncio.Task[None] | None) -> None:

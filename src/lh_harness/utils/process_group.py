@@ -22,9 +22,17 @@ import sys
 import threading
 import time
 
+from . import win_job
+
 _lock = threading.Lock()
 _tracked: set[int] = set()
 _installed = False
+
+# Windows has no SIGKILL constant.  There the pid-based fallback in
+# signal_process_group already terminates hard (TerminateProcess), and the
+# Job Object tree kill covers group semantics, so SIGTERM is the correct
+# stand-in for the escalation constant on that platform.
+SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 
 def track_process_group(pid: int) -> None:
@@ -46,12 +54,17 @@ def signal_process_group(pid: int, sig: int) -> bool:
         except (ProcessLookupError, PermissionError, OSError):
             return False
         return True
-    # Windows: no cross-PID process groups; target the tracked PID directly.
-    try:
-        os.kill(pid, sig)
-    except (ProcessLookupError, PermissionError, OSError):
-        return False
-    return True
+    # Windows: prefer the Job Object recorded for this pid — the handle, not
+    # the pid, selects the victim, so a reused pid can never redirect the
+    # kill.  Without a job (operator-initiated stops of externally launched
+    # workers), fall back to a liveness-checked hard kill of that pid.
+    if sig == 0:
+        # Existence probe: os.kill(pid, 0) terminates on Windows, so answer
+        # from a query-only handle instead.
+        return win_job.pid_alive(pid)
+    if win_job.kill_tree(pid):
+        return True
+    return win_job.kill_pid_tree(pid, sig)
 
 
 def kill_process_group(pid: int, *, grace_seconds: float = 1.0) -> None:
@@ -66,16 +79,29 @@ def kill_process_group(pid: int, *, grace_seconds: float = 1.0) -> None:
     while time.monotonic() < deadline:
         # Signal 0 only probes for existence; once the group is gone the CLI has
         # flushed its trajectory and there is nothing left to escalate against.
-        if not signal_process_group(pid, 0):
+        if os.name == "nt":
+            alive = win_job.pid_alive(pid)
+        else:
+            alive = signal_process_group(pid, 0)
+        if not alive:
             return
         time.sleep(0.05)
-    signal_process_group(pid, signal.SIGKILL)
+    signal_process_group(pid, SIGKILL)
 
 
 def kill_all_tracked() -> None:
     with _lock:
         pids = list(_tracked)
         _tracked.clear()
+    if not pids:
+        return
+    if win_job.supported():
+        # Job Objects terminate whole trees and are immune to pid reuse; any
+        # pid without a recorded job still gets the liveness-checked fallback.
+        for pid in pids:
+            if not win_job.kill_tree(pid):
+                win_job.kill_pid_tree(pid, SIGKILL)
+        return
     for pid in pids:
         kill_process_group(pid)
 
