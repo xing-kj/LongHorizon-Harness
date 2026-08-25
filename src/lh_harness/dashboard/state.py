@@ -27,7 +27,13 @@ from pathlib import Path
 from typing import Any
 
 from ..types import DEFAULT_LOG_DIR, MAX_ROUNDS
-from ..supervisor.control_bus import ControlBus, _ensure_dir_fd_nofollow, _open_private_regular_at
+from ..supervisor.control_bus import (
+    ControlBus,
+    _anchored_parent,
+    _ensure_dir_fd_nofollow,
+    _open_private_regular_at,
+    _process_lock,
+)
 from ..supervisor.lifecycle import ACTIVE_STATUSES, TERMINAL_STATUSES, canonical_lifecycle_status
 from ..utils.run_boundary import safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
 
@@ -894,21 +900,18 @@ class DashboardState:
             # path-based mkdir followed by open would permit a swapped
             # ``role_management`` directory to redirect this append.
             parent_fd = _ensure_dir_fd_nofollow(path.parent)
-            fd = _open_private_regular_at(parent_fd, path.name, os.O_WRONLY | os.O_APPEND)
+            fd = _open_private_regular_at(
+                _anchored_parent(parent_fd, path.parent), path.name, os.O_WRONLY | os.O_APPEND
+            )
             with os.fdopen(fd, "a", encoding="utf-8") as fh:
                 fd = None
-                try:
-                    import fcntl
-
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-                except ImportError as exc:
-                    raise OSError("secure approval-log locking is unavailable") from exc
-                try:
-                    fh.write(line)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                finally:
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                with _process_lock(fh):
+                    try:
+                        fh.write(line)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    finally:
+                        pass
         except (ImportError, OSError):
             # Approval persistence is diagnostic/control state. A read-only or
             # unavailable log must not crash the manager's execution loop.
@@ -919,7 +922,7 @@ class DashboardState:
                     os.close(fd)
                 except OSError:
                     pass
-            if parent_fd is not None:
+            if parent_fd is not None and parent_fd >= 0:
                 try:
                     os.close(parent_fd)
                 except OSError:

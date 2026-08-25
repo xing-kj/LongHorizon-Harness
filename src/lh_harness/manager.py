@@ -55,6 +55,7 @@ from .types import (
     RoleNextStep,
 )
 from .supervisor.control_bus import (
+    _SECURE_DIRFD as _SECURE_EVENT_APPEND,
     _append_jsonl as _append_jsonl_nofollow,
     _atomic_bytes_write,
     _ensure_dir_nofollow,
@@ -2402,6 +2403,28 @@ def _append_event(path: Path, event: str, payload: dict[str, Any]) -> None:
     # Event ids are assigned while holding the file lock, so the same absolute
     # id survives snapshot truncation, REST replay, and a reconnect after an
     # API restart.  The legacy ``event`` field remains for old readers.
+    if not _SECURE_EVENT_APPEND:
+        # Windows fallback: plain validated append without anchored walking.
+        # The event flock below is best-effort on this platform anyway.
+        with open(str(path), "a+", encoding="utf-8") as fh:
+            fh.seek(0)
+            sequence = sum(1 for line in fh if line.strip()) + 1
+            fh.seek(0, 2)
+            run_id = path.parents[2].name if len(path.parents) > 2 else "local"
+            record = {
+                "schema_version": 1,
+                "event_id": f"{run_id}:{sequence:06d}",
+                "ts": time.time(),
+                "event": event,
+                **_json_safe(payload),
+            }
+            fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        return
     parent_fd: int | None = None
     raw_fd: int | None = None
     try:

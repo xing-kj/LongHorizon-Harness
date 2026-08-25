@@ -40,8 +40,15 @@ def untrack_process_group(pid: int) -> None:
 
 def signal_process_group(pid: int, sig: int) -> bool:
     """Best-effort ``killpg``; False means the group is already gone."""
+    if hasattr(os, "killpg"):
+        try:
+            os.killpg(pid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+        return True
+    # Windows: no cross-PID process groups; target the tracked PID directly.
     try:
-        os.killpg(pid, sig)
+        os.kill(pid, sig)
     except (ProcessLookupError, PermissionError, OSError):
         return False
     return True
@@ -87,7 +94,13 @@ def _install_handlers() -> None:
     if threading.current_thread() is not threading.main_thread():
         return
 
-    for sig in (signal.SIGTERM, signal.SIGHUP):
+    for sig in [
+        getattr(signal, name)
+        for name in ("SIGTERM", "SIGHUP")
+        if hasattr(signal, name)
+    ]:
+        if not sig:
+            continue
         try:
             previous = signal.getsignal(sig)
         except (ValueError, OSError):

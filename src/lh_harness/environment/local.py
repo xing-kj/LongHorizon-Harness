@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 from ..types import DEFAULT_TMP_DIR, ExecResult
-from ..supervisor.control_bus import _ensure_dir_fd_nofollow, _open_private_regular_at
+from ..supervisor.control_bus import _anchored_parent, _ensure_dir_fd_nofollow, _open_private_regular_at
 from ..trajectory_artifacts import StreamingTrajectoryArtifactWriter
 from ..utils.process_group import (
     kill_process_group,
@@ -57,7 +57,7 @@ def _open_trajectory_file(path: Path):
     fd: int | None = None
     try:
         fd = _open_private_regular_at(
-            parent_fd,
+            _anchored_parent(parent_fd, path.parent),
             path.name,
             os.O_WRONLY,
             mode=0o600,
@@ -93,6 +93,14 @@ class LocalEnvironment:
     def staging_dir(self) -> Path:
         """Where callers may stage files before uploading them into this env."""
         return self._tmp_dir
+
+    async def ensure_dir(self, remote_path: str) -> None:
+        """Native directory creation (no POSIX shell required)."""
+        Path(remote_path).expanduser().mkdir(parents=True, exist_ok=True)
+
+    async def chmod(self, remote_path: str, mode: str) -> None:
+        """POSIX permission bits have no NTFS equivalent; nothing to do."""
+        return None
 
     async def exec(
         self,

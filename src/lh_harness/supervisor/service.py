@@ -27,13 +27,16 @@ from typing import Any
 from .control_bus import (
     ControlBus,
     RevisionConflict,
+    _SECURE_DIRFD,
     _atomic_bytes_write,
     _ensure_dir_fd_nofollow,
     _ensure_dir_nofollow,
     _open_nofollow,
     _open_private_regular_at,
+    _process_lock,
     _read_json_file,
     _read_jsonl,
+    _validate_no_symlink_chain,
 )
 from .lifecycle import (
     ACTIVE_STATUSES,
@@ -641,6 +644,17 @@ class RunSupervisor:
         """Serialize launch/resume idempotency transactions across workers."""
 
         lock_path = self.runs_root / ".supervisor.lock"
+        if not _SECURE_DIRFD:
+            # Windows fallback: validated path + msvcrt byte-range lock.
+            lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            _validate_no_symlink_chain(lock_path.parent)
+            fallback_handle = open(str(lock_path), "a+", encoding="utf-8")
+            try:
+                with _process_lock(fallback_handle):
+                    yield
+            finally:
+                fallback_handle.close()
+            return
         handle = None
         flock = None
         raw_fd: int | None = None
@@ -1019,7 +1033,7 @@ class RunSupervisor:
                     "signal_replay_attempted_at": time.time(),
                 }
             )
-            if str(owner.get("signal_mode") or "pgid") == "pid":
+            if str(owner.get("signal_mode") or "pgid") == "pid" or not hasattr(os, "killpg"):
                 os.kill(pid, sig)
             else:
                 os.killpg(pgid, sig)
@@ -1725,7 +1739,10 @@ class RunSupervisor:
             # unowned worker running if the durable reservation cannot be
             # promoted to a live owner.
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                if hasattr(os, "killpg"):
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
             except OSError:
                 pass
             raise
@@ -2135,8 +2152,11 @@ class RunSupervisor:
             if process.poll() is not None:
                 continue
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
+                if hasattr(os, "killpg"):
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except (ProcessLookupError, AttributeError):
                 pass
             except PermissionError:
                 # These are still verified in-memory children; fall back to

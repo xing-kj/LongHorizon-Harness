@@ -12,6 +12,7 @@ from ..environment.base import Environment
 from ..environment.remote_files import write_remote_text
 from ..runtime_signals import detect_runtime_signals
 from ..types import DEFAULT_TMP_DIR, DEFAULT_WORKSPACE_PATH, EpisodeBudget, EpisodeResult
+from ..utils.platform_shell import cd_command, shell_quote
 
 _SECRET_NAME = r"(?:API[_-]?KEY|AUTH[_-]?TOKEN|ACCESS[_-]?TOKEN|SECRET|PASSWORD|TOKEN)"
 _SECRET_VALUE = r"(?:'[^']*'|\"[^\"]*\"|\S+)"
@@ -66,11 +67,11 @@ class CommandAgentAdapter:
         # try to interpret as placeholders.
         command_body = self.command_template
         for placeholder, value in (
-            ("{prompt_path}", shlex.quote(prompt_path)),
+            ("{prompt_path}", shell_quote(prompt_path)),
             ("{timeout}", str(budget.max_duration_seconds)),
         ):
             command_body = command_body.replace(placeholder, value)
-        command = f"cd {shlex.quote(self.workspace_path)} && {command_body}"
+        command = f"{cd_command(self.workspace_path)} && {command_body}"
         # When a live path is given (local runs), the environment mirrors stdout
         # to that file line-by-line so the dashboard shows the trajectory live.
         result = await env.exec(

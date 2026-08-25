@@ -17,6 +17,7 @@ from ..types import (
     EpisodeResult,
 )
 from ..utils.agent_cli import resolve_opencode_binary
+from ..utils.platform_shell import env_prefix, shell_quote
 from .cli_agent import CommandAgentAdapter
 
 _CONFIG_FILENAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -59,11 +60,11 @@ class OpenCodeAdapter(CommandAgentAdapter):
         )
 
         opencode_binary = resolve_opencode_binary() or "opencode"
-        env_parts: list[str] = []
+        env_assignments: list[tuple[str, str]] = []
         if api_key:
             # OpenCode falls back to OPENCODE_API_KEY when a provider has no
             # key of its own, so one harness credential covers every model.
-            env_parts.append(f"OPENCODE_API_KEY={shlex.quote(api_key)}")
+            env_assignments.append(("OPENCODE_API_KEY", api_key))
         if base_url:
             provider_id = normalized_model.split("/", 1)[0].strip() or "opencode"
             config_path = _write_endpoint_config(prompt_dir, provider_id, base_url)
@@ -71,26 +72,26 @@ class OpenCodeAdapter(CommandAgentAdapter):
             # OPENCODE_CONFIG sits between the global and project configs, so
             # a per-run file carrying only the provider override keeps the
             # user's own providers, models, and MCP servers intact.
-            env_parts.append(f"OPENCODE_CONFIG={shlex.quote(config_path)}")
+            env_assignments.append(("OPENCODE_CONFIG", config_path))
 
         command_parts = [
-            shlex.quote(opencode_binary),
+            shell_quote(opencode_binary),
             "run",
             "--format",
             "json",
             "--yolo",
             "--model",
-            shlex.quote(normalized_model),
+            shell_quote(normalized_model),
         ]
         if normalized_effort:
-            command_parts.extend(["--variant", shlex.quote(normalized_effort)])
+            command_parts.extend(["--variant", shell_quote(normalized_effort)])
         # `opencode run` reads the prompt from stdin when no positional message
         # is given, keeping long prompts off the command line.
         command_parts.append("< {prompt_path}")
 
-        env_prefix = (" ".join(env_parts) + " ") if env_parts else ""
+        env_prefix_text = env_prefix(env_assignments)
         super().__init__(
-            command_template=f"{env_prefix}{' '.join(command_parts)}",
+            command_template=f"{env_prefix_text}{' '.join(command_parts)}",
             prompt_dir=prompt_dir,
             workspace_path=workspace_path,
             visible_output_parser=extract_opencode_visible_output,
