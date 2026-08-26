@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import posixpath
 import re
+import posixpath
 import shlex
 import time
 import uuid
@@ -10,6 +10,7 @@ from pathlib import PurePath
 
 from ..environment.base import Environment
 from ..environment.remote_files import write_remote_text
+from ..agent_logs import token_usage as parse_token_usage
 from ..runtime_signals import detect_runtime_signals
 from ..types import DEFAULT_TMP_DIR, DEFAULT_WORKSPACE_PATH, EpisodeBudget, EpisodeResult
 from ..utils.platform_shell import cd_command, shell_quote
@@ -96,27 +97,34 @@ class CommandAgentAdapter:
             error = f"Episode timed out after {budget.max_duration_seconds}s."
         else:
             error = redact_secrets(result.stderr[-2000:]) if result.exit_code != 0 else None
+        try:
+            token_usage = parse_token_usage(stdout_log)
+        except (OSError, ValueError):
+            token_usage = {}
+        metadata = {
+            "command": redact_secrets(command),
+            "workspace": self.workspace_path,
+            "prompt_path": prompt_path,
+            "exit_code": result.exit_code,
+            "termination_reason": result.termination_reason,
+            "actions_log_chars": len(actions_log),
+            "trajectory_format": "jsonl",
+            "assistant_visible_output": visible_output,
+            "runtime_signals": runtime_signals,
+            "actions_log_diagnostics_only": bool(
+                self.visible_output_parser is not None and not visible_output
+            ),
+            "stderr_chars": len(result.stderr),
+            "stderr_tail": redact_secrets(result.stderr[-2000:]),
+        }
+        if any(token_usage.get(key) for key in token_usage):
+            metadata["token_usage"] = token_usage
         return EpisodeResult(
             status=status,
             actions_log=actions_log,
             error=error,
             duration_ms=duration_ms,
-            metadata={
-                "command": redact_secrets(command),
-                "workspace": self.workspace_path,
-                "prompt_path": prompt_path,
-                "exit_code": result.exit_code,
-                "termination_reason": result.termination_reason,
-                "actions_log_chars": len(actions_log),
-                "trajectory_format": "jsonl",
-                "assistant_visible_output": visible_output,
-                "runtime_signals": runtime_signals,
-                "actions_log_diagnostics_only": bool(
-                    self.visible_output_parser is not None and not visible_output
-                ),
-                "stderr_chars": len(result.stderr),
-                "stderr_tail": redact_secrets(result.stderr[-2000:]),
-            },
+            metadata=metadata,
         )
 
 
